@@ -1,0 +1,1248 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly APT_REGISTRY_VERSION="0.1.0"
+
+readonly APT_ETC_DIR="/etc/apt"
+readonly MAIN_SOURCES_FILE="$APT_ETC_DIR/sources.list"
+readonly SOURCES_PARTS_DIR="$APT_ETC_DIR/sources.list.d"
+readonly STATE_DIR="/var/lib/apt-registry"
+readonly STATE_FILE="$STATE_DIR/state"
+readonly STATE_FILES_DIR="$STATE_DIR/files"
+readonly LOCK_FILE="$STATE_DIR/lock"
+readonly USER_UPSTREAMS_FILE="/etc/apt-registry/upstreams"
+readonly APT_HELPER="/usr/lib/apt/apt-helper"
+readonly LOCK_WAIT_SECONDS=10
+readonly PING_TIMEOUT_SECONDS=5
+
+readonly EXIT_USAGE=1
+readonly EXIT_UNREACHABLE=2
+readonly EXIT_UPDATE_FAILED=3
+readonly EXIT_LOCKED=4
+readonly EXIT_NOT_ACTIVE=5
+
+readonly DEFAULT_UPSTREAMS="
+archive.ubuntu.com/ubuntu              /ubuntu
+*.archive.ubuntu.com/ubuntu            /ubuntu
+security.ubuntu.com/ubuntu             /ubuntu-security
+ports.ubuntu.com/ubuntu-ports          /ubuntu-ports
+deb.debian.org/debian                  /debian
+deb.debian.org/debian-security         /debian-security
+security.debian.org/debian-security    /debian-security
+download.docker.com/linux/ubuntu       /docker-ubuntu
+download.docker.com/linux/debian       /docker-debian
+deb.nodesource.com/node_22.x           /nodesource
+"
+
+COLOR_RED=""
+COLOR_YELLOW=""
+COLOR_GREEN=""
+COLOR_BOLD=""
+COLOR_RESET=""
+
+WORK_DIR=""
+CLEANUP_PATHS=()
+
+MIRROR_URL=""
+NORMALIZED_URL=""
+NORMALIZATION_ERROR=""
+STATE_MIRROR_URL=""
+STATE_SET_AT=""
+STATE_VERSION=""
+PING_FAILURE=""
+
+UPSTREAM_PREFIXES=()
+UPSTREAM_PREFIXES_LONGEST_FIRST=()
+declare -A MIRROR_PATH_BY_PREFIX=()
+MATCHED_MIRROR_PATH=""
+
+MAPPED_URI=""
+MAPPED_TEXT=""
+TRANSFORMED_LINE=""
+DEB822_IN_URIS_FIELD=false
+
+FILE_REPLACED_TOKENS=()
+SUMMARY_MIRRORED=()
+SUMMARY_DIRECT=()
+COLLECTED_URIS=()
+declare -A ORIGINAL_URI_BY_MIRROR_URI=()
+
+SOURCE_PATHS=()
+SOURCE_FORMATS=()
+
+SET_CHANGED_PATHS=()
+SET_PLANNED_FILES=()
+SET_TOKEN_FILES=()
+
+STATUS_MIRROR_ENTRIES=0
+STATUS_HAND_SET_ENTRIES=0
+
+UNSET_PATHS=()
+UNSET_ACTIONS=()
+UNSET_PLANNED_FILES=()
+declare -A UNSET_PLANNED_BY_PATH=()
+
+enable_colors_for_terminal() {
+  if [[ -t 2 && -z ${NO_COLOR:-} ]]; then
+    COLOR_RED=$'\e[31m'
+    COLOR_YELLOW=$'\e[33m'
+    COLOR_GREEN=$'\e[32m'
+    COLOR_BOLD=$'\e[1m'
+    COLOR_RESET=$'\e[0m'
+  fi
+}
+
+say() {
+  printf '%s\n' "$*" >&2
+}
+
+say_heading() {
+  printf '%s%s%s\n' "$COLOR_BOLD" "$*" "$COLOR_RESET" >&2
+}
+
+say_success() {
+  printf '%s%s%s\n' "$COLOR_GREEN" "$*" "$COLOR_RESET" >&2
+}
+
+say_indented_unique_lines() {
+  if (($# > 0)); then
+    printf '  %s\n' "$@" | awk '!seen[$0]++' >&2
+  fi
+}
+
+warn() {
+  printf '%swarning:%s %s\n' "$COLOR_YELLOW" "$COLOR_RESET" "$*" >&2
+}
+
+fail() {
+  local exit_code=$1
+  shift
+  printf '%serror:%s %s\n' "$COLOR_RED" "$COLOR_RESET" "$*" >&2
+  exit "$exit_code"
+}
+
+usage_error() {
+  printf '%serror:%s %s\n' "$COLOR_RED" "$COLOR_RESET" "$*" >&2
+  printf "Run 'apt-registry help' for usage.\n" >&2
+  exit "$EXIT_USAGE"
+}
+
+print_help() {
+  cat <<EOF
+apt-registry $APT_REGISTRY_VERSION - switch apt sources between upstream repositories and a mirror
+
+Usage:
+  apt-registry set [<mirror-url>] [--dry-run] [--no-update] [--force]
+  apt-registry get
+  apt-registry unset [--dry-run] [--no-update]
+  apt-registry status
+  apt-registry upstreams
+  apt-registry version
+  apt-registry help
+
+Commands:
+  set         Rewrite known upstream URIs in the apt sources to go through the mirror.
+              <mirror-url> defaults to \$APT_REGISTRY_URL.
+  get         Print the active mirror URL. Exits 1 and prints nothing when none is active.
+  unset       Switch the apt sources back to the upstream repositories.
+  status      Show the active mirror, its reachability and every source apt uses.
+  upstreams   Print the effective upstream map: <upstream-prefix> <mirror-path>.
+  version     Print the version.
+  help        Print this help.
+
+Options:
+  --dry-run   Print a unified diff of the changes on stdout and write nothing.
+  --no-update Do not run apt-get update afterwards.
+  --force     Switch even when the mirror does not answer <mirror-url>/-/ping.
+
+Environment:
+  APT_REGISTRY_URL  Default mirror URL for 'set' (example: http://mirror.example.com:3142).
+  NO_COLOR          Disable colored output when set to a non-empty value.
+
+Files:
+  $USER_UPSTREAMS_FILE  Extra or overriding upstream map entries.
+  $STATE_DIR/      State of the active mirror (originals, hashes, lock).
+
+Exit codes:
+  0  success
+  1  usage error
+  2  mirror unreachable
+  3  apt-get update failed and the change was rolled back
+  4  another apt-registry run holds the lock
+  5  nothing to restore (mirror is not active)
+EOF
+}
+
+cleanup_on_exit() {
+  local cleanup_path
+  for cleanup_path in "${CLEANUP_PATHS[@]}"; do
+    rm -rf -- "$cleanup_path"
+  done
+  if [[ -n $WORK_DIR ]]; then
+    rm -rf -- "$WORK_DIR"
+  fi
+}
+
+create_work_dir() {
+  WORK_DIR=$(mktemp -d -t apt-registry.XXXXXX)
+}
+
+reject_extra_arguments() {
+  local command_name=$1
+  shift
+  if [[ ${1:-} == -h || ${1:-} == --help ]]; then
+    print_help
+    exit 0
+  fi
+  if (($# > 0)); then
+    usage_error "'$command_name' takes no arguments, got: $*"
+  fi
+}
+
+running_as_root() {
+  [[ $EUID -eq 0 ]]
+}
+
+reexec_as_root_if_needed() {
+  if running_as_root; then
+    return 0
+  fi
+  if ! command -v sudo >/dev/null 2>&1; then
+    fail "$EXIT_USAGE" "'apt-registry $1' changes /etc/apt and needs root; run it as root (sudo is not installed)"
+  fi
+  local self_path
+  self_path=$(realpath -- "${BASH_SOURCE[0]}")
+  local -a root_command=(sudo --)
+  if [[ -n ${NO_COLOR:-} ]]; then
+    root_command+=(env "NO_COLOR=$NO_COLOR")
+  fi
+  if [[ ! -x $self_path ]]; then
+    root_command+=(bash)
+  fi
+  exec "${root_command[@]}" "$self_path" "$@"
+}
+
+ensure_state_dir() {
+  if [[ ! -d $STATE_DIR ]]; then
+    mkdir -m 0755 -- "$STATE_DIR"
+  fi
+}
+
+acquire_lock() {
+  ensure_state_dir
+  local lock_fd
+  exec {lock_fd}>>"$LOCK_FILE"
+  chmod 0644 "$LOCK_FILE"
+  if flock -n "$lock_fd"; then
+    return 0
+  fi
+  say "Waiting up to ${LOCK_WAIT_SECONDS}s for another apt-registry run to finish..."
+  if ! flock -w "$LOCK_WAIT_SECONDS" "$lock_fd"; then
+    fail "$EXIT_LOCKED" "another apt-registry run holds $LOCK_FILE; try again when it has finished"
+  fi
+}
+
+try_normalize_mirror_url() {
+  local raw_url=$1
+  local url_pattern='^([A-Za-z][A-Za-z0-9+.-]*)://([^/?#[:space:]]+)(/[^?#[:space:]]*)?$'
+  NORMALIZED_URL=""
+  if [[ $raw_url != *://* ]]; then
+    NORMALIZATION_ERROR="mirror URL needs a scheme, for example http://$raw_url"
+    return 1
+  fi
+  if [[ $raw_url == *'?'* || $raw_url == *'#'* ]]; then
+    NORMALIZATION_ERROR="mirror URL must not contain a query or a fragment: $raw_url"
+    return 1
+  fi
+  if [[ ! $raw_url =~ $url_pattern ]]; then
+    NORMALIZATION_ERROR="mirror URL must look like http://host[:port][/path]: $raw_url"
+    return 1
+  fi
+  local scheme=${BASH_REMATCH[1],,}
+  local authority=${BASH_REMATCH[2]}
+  local path=${BASH_REMATCH[3]}
+  if [[ $scheme != http && $scheme != https ]]; then
+    NORMALIZATION_ERROR="mirror URL scheme must be http or https, got '$scheme': $raw_url"
+    return 1
+  fi
+  while [[ $path == */ ]]; do
+    path=${path%/}
+  done
+  NORMALIZED_URL="$scheme://$(lowercase_host_in_authority "$authority")$path"
+}
+
+lowercase_host_in_authority() {
+  local authority=$1
+  local host=${authority##*@}
+  if [[ $authority == *@* ]]; then
+    printf '%s@%s' "${authority%@*}" "${host,,}"
+  else
+    printf '%s' "${host,,}"
+  fi
+}
+
+host_of_url() {
+  local url=$1
+  local authority=${url#*://}
+  authority=${authority%%/*}
+  authority=${authority##*@}
+  printf '%s' "${authority%%:*}"
+}
+
+register_upstream() {
+  local prefix=$1 mirror_path=$2
+  if [[ -z ${MIRROR_PATH_BY_PREFIX[$prefix]:-} ]]; then
+    UPSTREAM_PREFIXES+=("$prefix")
+  fi
+  MIRROR_PATH_BY_PREFIX[$prefix]=$mirror_path
+}
+
+normalize_upstream_prefix() {
+  local prefix=$1
+  while [[ $prefix == */ ]]; do
+    prefix=${prefix%/}
+  done
+  local host=${prefix%%/*}
+  printf '%s%s' "${host,,}" "${prefix#"$host"}"
+}
+
+validate_upstream_entry() {
+  local prefix=$1 mirror_path=$2
+  local prefix_pattern='^(\*\.)?[a-z0-9][a-z0-9.-]*(:[0-9]{1,5})?(/[^[:space:]/]+)*$'
+  local mirror_path_pattern='^(/[A-Za-z0-9._~+-]+)+$'
+  if [[ $prefix == *://* ]]; then
+    printf 'upstream prefix must not include a scheme: %s' "$prefix"
+  elif [[ ! $prefix =~ $prefix_pattern ]]; then
+    printf 'invalid upstream prefix: %s' "$prefix"
+  elif [[ -z $mirror_path ]]; then
+    printf 'missing mirror path after %s' "$prefix"
+  elif [[ ! $mirror_path =~ $mirror_path_pattern ]]; then
+    printf 'mirror path must start with / and have no trailing slash: %s' "$mirror_path"
+  fi
+}
+
+parse_upstream_text() {
+  local source_name=$1 text=$2
+  local line line_number=0 prefix mirror_path extra problem
+  while IFS= read -r line || [[ -n $line ]]; do
+    line_number=$((line_number + 1))
+    line=${line%$'\r'}
+    if [[ $line =~ ^[[:space:]]*(#.*)?$ ]]; then
+      continue
+    fi
+    read -r prefix mirror_path extra <<<"$line"
+    if [[ -n ${extra:-} ]]; then
+      fail "$EXIT_USAGE" "$source_name:$line_number: expected '<upstream-prefix> <mirror-path>', got: $line"
+    fi
+    prefix=$(normalize_upstream_prefix "$prefix")
+    problem=$(validate_upstream_entry "$prefix" "${mirror_path:-}")
+    if [[ -n $problem ]]; then
+      fail "$EXIT_USAGE" "$source_name:$line_number: $problem"
+    fi
+    register_upstream "$prefix" "$mirror_path"
+  done <<<"$text"
+}
+
+sort_upstreams_longest_first() {
+  mapfile -t UPSTREAM_PREFIXES_LONGEST_FIRST < <(
+    printf '%s\n' "${UPSTREAM_PREFIXES[@]}" | awk '{ print length($0) " " $0 }' | sort -s -k1,1nr | cut -d' ' -f2-
+  )
+}
+
+load_upstream_map() {
+  parse_upstream_text "built-in map" "$DEFAULT_UPSTREAMS"
+  if [[ -e $USER_UPSTREAMS_FILE ]]; then
+    if [[ ! -r $USER_UPSTREAMS_FILE ]]; then
+      fail "$EXIT_USAGE" "cannot read $USER_UPSTREAMS_FILE"
+    fi
+    parse_upstream_text "$USER_UPSTREAMS_FILE" "$(<"$USER_UPSTREAMS_FILE")"
+  fi
+  sort_upstreams_longest_first
+}
+
+is_http_uri() {
+  local http_pattern='^[Hh][Tt][Tt][Pp][Ss]?://'
+  [[ $1 =~ $http_pattern ]]
+}
+
+host_matches_prefix_host() {
+  local host=$1 prefix_host=$2
+  if [[ $prefix_host == '*.'* ]]; then
+    local required_suffix=${prefix_host#\*}
+    [[ $host == *"$required_suffix" && ${#host} -gt ${#required_suffix} ]]
+  else
+    [[ $host == "$prefix_host" ]]
+  fi
+}
+
+find_mirror_path_for_uri() {
+  local uri=$1
+  local uri_pattern='^[Hh][Tt][Tt][Pp][Ss]?://([^/]+)(/.*)?$'
+  MATCHED_MIRROR_PATH=""
+  if [[ ! $uri =~ $uri_pattern ]]; then
+    return 1
+  fi
+  local host=${BASH_REMATCH[1],,}
+  local path=${BASH_REMATCH[2]}
+  while [[ $path == */ ]]; do
+    path=${path%/}
+  done
+  local prefix prefix_host
+  for prefix in "${UPSTREAM_PREFIXES_LONGEST_FIRST[@]}"; do
+    prefix_host=${prefix%%/*}
+    if [[ $path == "${prefix#"$prefix_host"}" ]] && host_matches_prefix_host "$host" "$prefix_host"; then
+      MATCHED_MIRROR_PATH=${MIRROR_PATH_BY_PREFIX[$prefix]}
+      return 0
+    fi
+  done
+  return 1
+}
+
+uri_is_under_url() {
+  local uri=$1 base_url=$2
+  [[ -n $base_url && ($uri == "$base_url" || $uri == "$base_url"/*) ]]
+}
+
+map_uri_to_mirror() {
+  local uri=$1
+  MAPPED_URI=""
+  if uri_is_under_url "$uri" "$MIRROR_URL"; then
+    SUMMARY_MIRRORED+=("$uri (already through the mirror)")
+  elif ! is_http_uri "$uri"; then
+    SUMMARY_DIRECT+=("$uri (only http and https URIs are rewritten)")
+  elif find_mirror_path_for_uri "$uri"; then
+    MAPPED_URI="$MIRROR_URL$MATCHED_MIRROR_PATH"
+    FILE_REPLACED_TOKENS+=("$MAPPED_URI $uri")
+    SUMMARY_MIRRORED+=("$uri -> $MAPPED_URI")
+  else
+    SUMMARY_DIRECT+=("$uri (not in the upstream map)")
+  fi
+}
+
+map_mirror_uri_back() {
+  local uri=$1
+  MAPPED_URI=${ORIGINAL_URI_BY_MIRROR_URI[$uri]:-}
+  if [[ -z $MAPPED_URI && $uri == */ ]]; then
+    MAPPED_URI=${ORIGINAL_URI_BY_MIRROR_URI[${uri%/}]:-}
+  fi
+}
+
+collect_uri() {
+  COLLECTED_URIS+=("$1")
+  MAPPED_URI=""
+}
+
+map_uri_tokens_in_text() {
+  local remaining=$1 mapper=$2
+  local token_pattern='^([[:space:]]*)([^[:space:]]+)(.*)$'
+  local result="" token
+  while [[ $remaining =~ $token_pattern ]]; do
+    result+=${BASH_REMATCH[1]}
+    token=${BASH_REMATCH[2]}
+    remaining=${BASH_REMATCH[3]}
+    "$mapper" "$token"
+    result+=${MAPPED_URI:-$token}
+  done
+  MAPPED_TEXT="$result$remaining"
+}
+
+transform_one_line_entry() {
+  local line=$1 mapper=$2
+  local entry_pattern='^([[:space:]]*deb(-src)?[[:space:]]+(\[[^]]*\][[:space:]]*)?)(cdrom:\[[^]]*\][^[:space:]]*|[^[:space:]]+)(.*)$'
+  TRANSFORMED_LINE=$line
+  if [[ ! $line =~ $entry_pattern ]]; then
+    return 0
+  fi
+  local head=${BASH_REMATCH[1]}
+  local uri=${BASH_REMATCH[4]}
+  local tail=${BASH_REMATCH[5]}
+  "$mapper" "$uri"
+  TRANSFORMED_LINE="$head${MAPPED_URI:-$uri}$tail"
+}
+
+transform_deb822_line() {
+  local line=$1 mapper=$2
+  local blank_pattern='^[[:space:]]*$'
+  local uris_field_pattern='^([Uu][Rr][Ii][Ss]:)(.*)$'
+  TRANSFORMED_LINE=$line
+  if [[ $line =~ $blank_pattern ]]; then
+    DEB822_IN_URIS_FIELD=false
+  elif [[ $line == '#'* ]]; then
+    return 0
+  elif [[ $line =~ $uris_field_pattern ]]; then
+    local field_name=${BASH_REMATCH[1]}
+    DEB822_IN_URIS_FIELD=true
+    map_uri_tokens_in_text "${BASH_REMATCH[2]}" "$mapper"
+    TRANSFORMED_LINE="$field_name$MAPPED_TEXT"
+  elif [[ $line == [[:space:]]* ]]; then
+    if [[ $DEB822_IN_URIS_FIELD == true ]]; then
+      map_uri_tokens_in_text "$line" "$mapper"
+      TRANSFORMED_LINE=$MAPPED_TEXT
+    fi
+  else
+    DEB822_IN_URIS_FIELD=false
+  fi
+}
+
+transform_line() {
+  local format=$1 line=$2 mapper=$3
+  if [[ $format == deb822 ]]; then
+    transform_deb822_line "$line" "$mapper"
+  else
+    transform_one_line_entry "$line" "$mapper"
+  fi
+}
+
+transform_source_file() {
+  local format=$1 input_path=$2 output_path=$3 mapper=$4
+  local line line_end carriage_return content=""
+  DEB822_IN_URIS_FIELD=false
+  while true; do
+    if IFS= read -r line; then
+      line_end=$'\n'
+    elif [[ -n $line ]]; then
+      line_end=""
+    else
+      break
+    fi
+    carriage_return=""
+    if [[ $line == *$'\r' ]]; then
+      carriage_return=$'\r'
+      line=${line%$'\r'}
+    fi
+    transform_line "$format" "$line" "$mapper"
+    content+="$TRANSFORMED_LINE$carriage_return$line_end"
+    if [[ -z $line_end ]]; then
+      break
+    fi
+  done <"$input_path"
+  printf '%s' "$content" >"$output_path"
+}
+
+source_format_for_path() {
+  if [[ $1 == *.sources ]]; then
+    printf 'deb822'
+  else
+    printf 'one-line'
+  fi
+}
+
+collect_source_files() {
+  SOURCE_PATHS=()
+  SOURCE_FORMATS=()
+  local -A already_collected=()
+  local -a candidates=("$MAIN_SOURCES_FILE")
+  local candidate resolved
+  shopt -s nullglob
+  candidates+=("$SOURCES_PARTS_DIR"/*.list "$SOURCES_PARTS_DIR"/*.sources)
+  shopt -u nullglob
+  for candidate in "${candidates[@]}"; do
+    if [[ ! -e $candidate ]]; then
+      continue
+    fi
+    resolved=$(realpath -e -- "$candidate")
+    if [[ $resolved != "$APT_ETC_DIR"/* ]]; then
+      warn "skipping $candidate: it is a symlink to $resolved, outside $APT_ETC_DIR"
+      continue
+    fi
+    if [[ ! -f $resolved || -n ${already_collected[$resolved]:-} ]]; then
+      continue
+    fi
+    if [[ ! -r $resolved ]]; then
+      warn "skipping $resolved: $(id -un) cannot read it; run as root to include it"
+      continue
+    fi
+    already_collected[$resolved]=1
+    SOURCE_PATHS+=("$resolved")
+    SOURCE_FORMATS+=("$(source_format_for_path "$candidate")")
+  done
+}
+
+file_sha256() {
+  sha256sum <"$1" | cut -d' ' -f1
+}
+
+replace_file_atomically() {
+  local target=$1 new_content=$2
+  local temporary
+  temporary=$(mktemp "$(dirname -- "$target")/.apt-registry.XXXXXX")
+  CLEANUP_PATHS+=("$temporary")
+  cat -- "$new_content" >"$temporary"
+  chown --reference="$target" -- "$temporary"
+  chmod --reference="$target" -- "$temporary"
+  mv -f -- "$temporary" "$target"
+}
+
+print_unified_diff() {
+  local current=$1 planned=$2 label=$3
+  local diff_status=0
+  diff -u --label "$label" --label "$label" -- "$current" "$planned" || diff_status=$?
+  if ((diff_status > 1)); then
+    fail "$diff_status" "diff failed for $label"
+  fi
+}
+
+allow_apt_sandbox_user() {
+  local directory=$1
+  if running_as_root && id _apt >/dev/null 2>&1; then
+    chown _apt -- "$directory"
+  fi
+}
+
+mirror_is_reachable() {
+  local url=$1
+  local probe_dir
+  probe_dir=$(mktemp -d -t apt-registry-ping.XXXXXX)
+  CLEANUP_PATHS+=("$probe_dir")
+  allow_apt_sandbox_user "$probe_dir"
+  PING_FAILURE=""
+  local helper_status=0
+  timeout "$PING_TIMEOUT_SECONDS" "$APT_HELPER" \
+    -o Acquire::Retries=0 \
+    -o "Acquire::http::Timeout=$PING_TIMEOUT_SECONDS" \
+    -o "Acquire::https::Timeout=$PING_TIMEOUT_SECONDS" \
+    download-file "$url/-/ping" "$probe_dir/ping" >"$probe_dir/log" 2>&1 || helper_status=$?
+  if ((helper_status == 124)); then
+    PING_FAILURE="no answer from $url/-/ping within ${PING_TIMEOUT_SECONDS}s"
+    return 1
+  fi
+  if ((helper_status != 0)); then
+    PING_FAILURE=$(describe_download_failure "$probe_dir/log" "$url/-/ping")
+    return 1
+  fi
+  if [[ $(head -c 1 -- "$probe_dir/ping") != "{" ]]; then
+    PING_FAILURE="$url/-/ping did not answer like an apt mirror (expected {})"
+    return 1
+  fi
+}
+
+describe_download_failure() {
+  local log_path=$1 ping_url=$2
+  local reason
+  reason=$(grep '^E: Failed to fetch ' "$log_path" | head -n 1 | sed -E 's/^E: Failed to fetch [^[:space:]]+[[:space:]]+//' || true)
+  if [[ -z $reason ]]; then
+    reason=$(grep '^E: ' "$log_path" | head -n 1 | sed 's/^E: //' || true)
+  fi
+  printf '%s' "${reason:-could not download $ping_url}"
+}
+
+check_mirror_before_set() {
+  local force=$1 dry_run=$2
+  if mirror_is_reachable "$MIRROR_URL"; then
+    say "Mirror $MIRROR_URL is reachable."
+  elif [[ $force == true ]]; then
+    warn "mirror is not reachable ($PING_FAILURE); continuing because of --force"
+  elif [[ $dry_run == true ]]; then
+    warn "mirror is not reachable ($PING_FAILURE); a real run would stop with exit code $EXIT_UNREACHABLE unless --force is given"
+  else
+    fail "$EXIT_UNREACHABLE" "mirror is not reachable: $PING_FAILURE. Nothing was changed. Use --force to switch anyway."
+  fi
+}
+
+load_state() {
+  STATE_MIRROR_URL=""
+  STATE_SET_AT=""
+  STATE_VERSION=""
+  if [[ ! -f $STATE_FILE ]]; then
+    return 1
+  fi
+  local key value
+  while IFS='=' read -r key value; do
+    case $key in
+      mirror_url) STATE_MIRROR_URL=$value ;;
+      set_at) STATE_SET_AT=$value ;;
+      version) STATE_VERSION=$value ;;
+    esac
+  done <"$STATE_FILE"
+  [[ -n $STATE_MIRROR_URL ]]
+}
+
+write_state_text() {
+  local target=$1 text=$2
+  printf '%s\n' "$text" >"$target"
+  chmod 0644 -- "$target"
+}
+
+copy_state_file() {
+  local source=$1 target=$2
+  cp -- "$source" "$target"
+  chmod 0644 -- "$target"
+}
+
+save_state() {
+  ensure_state_dir
+  local staging
+  staging=$(mktemp -d "$STATE_DIR/.staging.XXXXXX")
+  CLEANUP_PATHS+=("$staging")
+  chmod 0755 -- "$staging"
+  mkdir -m 0755 -- "$staging/files"
+  local index entry
+  for index in "${!SET_CHANGED_PATHS[@]}"; do
+    entry="$staging/files/$((index + 1))"
+    mkdir -m 0755 -- "$entry"
+    write_state_text "$entry/path" "${SET_CHANGED_PATHS[index]}"
+    copy_state_file "${SET_CHANGED_PATHS[index]}" "$entry/original"
+    write_state_text "$entry/after.sha256" "$(file_sha256 "${SET_PLANNED_FILES[index]}")"
+    copy_state_file "${SET_PLANNED_FILES[index]}" "$entry/after"
+    copy_state_file "${SET_TOKEN_FILES[index]}" "$entry/tokens"
+  done
+  write_state_text "$staging/state" "$(printf 'mirror_url=%s\nset_at=%s\nversion=%s' \
+    "$MIRROR_URL" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$APT_REGISTRY_VERSION")"
+  rm -rf -- "$STATE_FILES_DIR"
+  mv -T -- "$staging/files" "$STATE_FILES_DIR"
+  mv -T -- "$staging/state" "$STATE_FILE"
+  rmdir -- "$staging"
+}
+
+remove_state() {
+  rm -f -- "$STATE_FILE"
+  rm -rf -- "$STATE_FILES_DIR"
+}
+
+load_reverse_tokens() {
+  local tokens_file=$1
+  local mirror_uri original_uri
+  ORIGINAL_URI_BY_MIRROR_URI=()
+  while read -r mirror_uri original_uri; do
+    if [[ -n $mirror_uri && -z ${ORIGINAL_URI_BY_MIRROR_URI[$mirror_uri]:-} ]]; then
+      ORIGINAL_URI_BY_MIRROR_URI[$mirror_uri]=$original_uri
+    fi
+  done <"$tokens_file"
+}
+
+revert_edited_file() {
+  local entry=$1 path=$2 output=$3
+  load_reverse_tokens "$entry/tokens"
+  if [[ ! -f $entry/after ]]; then
+    transform_source_file "$(source_format_for_path "$path")" "$path" "$output" map_mirror_uri_back
+    return 0
+  fi
+  transform_source_file "$(source_format_for_path "$path")" "$path" "$output.tokens-reverted" map_mirror_uri_back
+  restore_untouched_lines "$entry/after" "$path" "$entry/original" "$output.tokens-reverted" "$output"
+}
+
+restore_untouched_lines() {
+  local after=$1 current=$2 original=$3 tokens_reverted=$4 output=$5
+  local -a original_lines=() reverted_lines=()
+  mapfile original_lines <"$original"
+  mapfile reverted_lines <"$tokens_reverted"
+  local line_map="$output.line-map" diff_status=0
+  diff --unchanged-line-format=$'=%dn\n' --old-line-format='' --new-line-format=$'+%dn\n' \
+    -- "$after" "$current" >"$line_map" || diff_status=$?
+  if ((diff_status > 1)); then
+    fail "$diff_status" "diff failed for $current"
+  fi
+  local marker content=""
+  while IFS= read -r marker; do
+    if [[ $marker == =* ]]; then
+      content+=${original_lines[${marker#=} - 1]}
+    else
+      content+=${reverted_lines[${marker#+} - 1]}
+    fi
+  done <"$line_map"
+  printf '%s' "$content" >"$output"
+}
+
+plan_unset_entry() {
+  local entry=$1 entry_number=$2
+  local path
+  path=$(<"$entry/path")
+  local action="missing" planned=""
+  if [[ ! -e $path ]]; then
+    action="missing"
+  elif [[ $(file_sha256 "$path") == "$(<"$entry/after.sha256")" ]]; then
+    action="restore"
+    planned="$entry/original"
+  else
+    planned="$WORK_DIR/unset.$entry_number"
+    revert_edited_file "$entry" "$path" "$planned"
+    if cmp -s -- "$path" "$planned"; then
+      action="unchanged"
+    else
+      action="revert"
+    fi
+  fi
+  UNSET_PATHS+=("$path")
+  UNSET_ACTIONS+=("$action")
+  UNSET_PLANNED_FILES+=("$planned")
+  if [[ $action == restore || $action == revert ]]; then
+    UNSET_PLANNED_BY_PATH[$path]=$planned
+  fi
+}
+
+plan_unset() {
+  UNSET_PATHS=()
+  UNSET_ACTIONS=()
+  UNSET_PLANNED_FILES=()
+  UNSET_PLANNED_BY_PATH=()
+  local entry_number=1
+  while [[ -d $STATE_FILES_DIR/$entry_number ]]; do
+    plan_unset_entry "$STATE_FILES_DIR/$entry_number" "$entry_number"
+    entry_number=$((entry_number + 1))
+  done
+}
+
+apply_unset_plan() {
+  local index
+  for index in "${!UNSET_PATHS[@]}"; do
+    case ${UNSET_ACTIONS[index]} in
+      restore | revert) replace_file_atomically "${UNSET_PATHS[index]}" "${UNSET_PLANNED_FILES[index]}" ;;
+    esac
+  done
+}
+
+describe_unset_action() {
+  local action=$1 path=$2 tense=$3
+  case $action:$tense in
+    restore:completed) printf 'Restored %s from the original copy' "$path" ;;
+    restore:planned) printf 'Would restore %s from the original copy' "$path" ;;
+    revert:completed) printf 'Reverted mirror URIs in %s (it was edited after set; the edits were kept)' "$path" ;;
+    revert:planned) printf 'Would revert mirror URIs in %s (it was edited after set; the edits are kept)' "$path" ;;
+    unchanged:*) printf 'Left %s as it is (it no longer contains mirror URIs)' "$path" ;;
+    missing:*) printf 'Skipped %s (the file no longer exists)' "$path" ;;
+  esac
+}
+
+print_unset_plan() {
+  local tense=$1
+  local index
+  for index in "${!UNSET_PATHS[@]}"; do
+    say "  $(describe_unset_action "${UNSET_ACTIONS[index]}" "${UNSET_PATHS[index]}" "$tense")"
+  done
+}
+
+print_unset_diffs() {
+  local index
+  for index in "${!UNSET_PATHS[@]}"; do
+    case ${UNSET_ACTIONS[index]} in
+      restore | revert) print_unified_diff "${UNSET_PATHS[index]}" "${UNSET_PLANNED_FILES[index]}" "${UNSET_PATHS[index]}" ;;
+    esac
+  done
+}
+
+write_replaced_tokens_file() {
+  local target=$1
+  : >"$target"
+  if ((${#FILE_REPLACED_TOKENS[@]} > 0)); then
+    printf '%s\n' "${FILE_REPLACED_TOKENS[@]}" | awk '!seen[$0]++' >"$target"
+  fi
+}
+
+plan_set_rewrites() {
+  SET_CHANGED_PATHS=()
+  SET_PLANNED_FILES=()
+  SET_TOKEN_FILES=()
+  collect_source_files
+  local index path base planned
+  for index in "${!SOURCE_PATHS[@]}"; do
+    path=${SOURCE_PATHS[index]}
+    base=${UNSET_PLANNED_BY_PATH[$path]:-$path}
+    planned="$WORK_DIR/set.$index"
+    FILE_REPLACED_TOKENS=()
+    transform_source_file "${SOURCE_FORMATS[index]}" "$base" "$planned" map_uri_to_mirror
+    if cmp -s -- "$path" "$planned"; then
+      continue
+    fi
+    write_replaced_tokens_file "$planned.tokens"
+    SET_CHANGED_PATHS+=("$path")
+    SET_PLANNED_FILES+=("$planned")
+    SET_TOKEN_FILES+=("$planned.tokens")
+  done
+}
+
+apply_set_rewrites() {
+  local index
+  for index in "${!SET_CHANGED_PATHS[@]}"; do
+    replace_file_atomically "${SET_CHANGED_PATHS[index]}" "${SET_PLANNED_FILES[index]}"
+  done
+}
+
+print_set_diffs() {
+  local index
+  for index in "${!SET_CHANGED_PATHS[@]}"; do
+    print_unified_diff "${SET_CHANGED_PATHS[index]}" "${SET_PLANNED_FILES[index]}" "${SET_CHANGED_PATHS[index]}"
+  done
+}
+
+print_rewrite_summary() {
+  if ((${#SET_CHANGED_PATHS[@]} > 0)); then
+    say_heading "Source files:"
+    say_indented_unique_lines "${SET_CHANGED_PATHS[@]}"
+  fi
+  if ((${#SUMMARY_MIRRORED[@]} > 0)); then
+    say_heading "Through the mirror:"
+    say_indented_unique_lines "${SUMMARY_MIRRORED[@]}"
+  fi
+  if ((${#SUMMARY_DIRECT[@]} > 0)); then
+    say_heading "Left direct (not rewritten):"
+    say_indented_unique_lines "${SUMMARY_DIRECT[@]}"
+  fi
+}
+
+run_apt_get_update() {
+  local log_path=$1
+  LC_ALL=C apt-get update 2>&1 | tee -- "$log_path" >&2
+}
+
+mirror_failures_in_log() {
+  local log_path=$1
+  grep -E '^(Err:[0-9]+ |E: |W: Failed to fetch )' "$log_path" | grep -F -- "$MIRROR_URL" || true
+}
+
+failures_of_other_repositories_in_log() {
+  local log_path=$1
+  grep -E '^(Err:[0-9]+ |E: |W: Failed to fetch )' "$log_path" | grep -vF -- "$MIRROR_URL" | grep -F '://' || true
+}
+
+apt_update_through_mirror_succeeds() {
+  local log_path=$1 update_status=0
+  run_apt_get_update "$log_path" || update_status=$?
+  if [[ -n $(mirror_failures_in_log "$log_path") ]]; then
+    return 1
+  fi
+  if ((update_status == 0)); then
+    return 0
+  fi
+  local other_failures
+  other_failures=$(failures_of_other_repositories_in_log "$log_path")
+  if [[ -z $other_failures ]]; then
+    return 1
+  fi
+  warn "apt-get update failed only for repositories that do not go through the mirror; the mirror stays active:"
+  printf '%s\n' "$other_failures" | awk '!seen[$0]++' | sed 's/^/  /' >&2
+  return 0
+}
+
+update_or_roll_back() {
+  local log_path="$WORK_DIR/apt-get-update.log"
+  say_heading "Running apt-get update through the mirror..."
+  if apt_update_through_mirror_succeeds "$log_path"; then
+    return 0
+  fi
+  local failures
+  failures=$(grep -E '^(E: |W: Failed to fetch )' "$log_path" || true)
+  warn "apt-get update failed through $MIRROR_URL; rolling back"
+  if [[ -n $failures ]]; then
+    printf '%s\n' "$failures" >&2
+  fi
+  plan_unset
+  apply_unset_plan
+  remove_state
+  print_unset_plan completed
+  say_heading "Running apt-get update again with the original sources..."
+  if ! run_apt_get_update "$WORK_DIR/apt-get-update-after-rollback.log"; then
+    warn "apt-get update also reported errors with the original sources"
+  fi
+  fail "$EXIT_UPDATE_FAILED" "apt-get update failed through $MIRROR_URL; the change was rolled back"
+}
+
+switch_away_from_active_mirror() {
+  local dry_run=$1
+  if [[ $dry_run == true ]]; then
+    say "Would switch from $STATE_MIRROR_URL to $MIRROR_URL."
+    plan_unset
+    return 0
+  fi
+  say "Switching from $STATE_MIRROR_URL to $MIRROR_URL; restoring the upstream sources first."
+  plan_unset
+  apply_unset_plan
+  remove_state
+  print_unset_plan completed
+  UNSET_PLANNED_BY_PATH=()
+}
+
+command_set() {
+  local requested_url="" dry_run=false run_update=true force=false
+  local -a passthrough_options=()
+  while (($# > 0)); do
+    case $1 in
+      --dry-run) dry_run=true ;;
+      --no-update) run_update=false ;;
+      --force) force=true ;;
+      -h | --help) print_help && exit 0 ;;
+      -*) usage_error "unknown option for 'set': $1" ;;
+      *)
+        if [[ -n $requested_url ]]; then
+          usage_error "'set' takes one mirror URL, got: $requested_url $1"
+        fi
+        requested_url=$1
+        ;;
+    esac
+    if [[ $1 == --* ]]; then
+      passthrough_options+=("$1")
+    fi
+    shift
+  done
+  requested_url=${requested_url:-${APT_REGISTRY_URL:-}}
+  if [[ -z $requested_url ]]; then
+    usage_error "no mirror URL given and APT_REGISTRY_URL is not set (example: apt-registry set http://mirror.example.com:3142)"
+  fi
+  try_normalize_mirror_url "$requested_url" || usage_error "$NORMALIZATION_ERROR"
+  MIRROR_URL=$NORMALIZED_URL
+  load_upstream_map
+  if [[ $dry_run == false ]]; then
+    reexec_as_root_if_needed set "$MIRROR_URL" "${passthrough_options[@]}"
+    acquire_lock
+  fi
+  create_work_dir
+  if load_state && [[ $STATE_MIRROR_URL == "$MIRROR_URL" ]]; then
+    say_success "Mirror $MIRROR_URL is already active; nothing to do."
+    return 0
+  fi
+  check_mirror_before_set "$force" "$dry_run"
+  if load_state; then
+    switch_away_from_active_mirror "$dry_run"
+  fi
+  plan_set_rewrites
+  if [[ $dry_run == true ]]; then
+    print_set_diffs
+    print_rewrite_summary
+    say "Dry run: nothing was written."
+    return 0
+  fi
+  if ((${#SET_CHANGED_PATHS[@]} == 0)); then
+    print_rewrite_summary
+    warn "no source entry matches a known upstream; nothing was changed"
+    return 0
+  fi
+  save_state
+  apply_set_rewrites
+  if [[ $run_update == true ]]; then
+    update_or_roll_back
+  fi
+  print_rewrite_summary
+  say_success "Mirror $MIRROR_URL is active."
+  if [[ $run_update == false ]]; then
+    say "apt-get update was not run (--no-update); run it to fetch the package lists through the mirror."
+  fi
+}
+
+command_unset() {
+  local dry_run=false run_update=true
+  local -a passthrough_options=()
+  while (($# > 0)); do
+    case $1 in
+      --dry-run) dry_run=true ;;
+      --no-update) run_update=false ;;
+      -h | --help) print_help && exit 0 ;;
+      *) usage_error "unknown argument for 'unset': $1" ;;
+    esac
+    passthrough_options+=("$1")
+    shift
+  done
+  if [[ $dry_run == false ]]; then
+    reexec_as_root_if_needed unset "${passthrough_options[@]}"
+    acquire_lock
+  fi
+  if ! load_state; then
+    fail "$EXIT_NOT_ACTIVE" "mirror is not active; nothing to restore"
+  fi
+  create_work_dir
+  plan_unset
+  if [[ $dry_run == true ]]; then
+    print_unset_diffs
+    say_heading "Switching back from $STATE_MIRROR_URL:"
+    print_unset_plan planned
+    say "Dry run: nothing was written."
+    return 0
+  fi
+  apply_unset_plan
+  remove_state
+  if [[ $run_update == true ]]; then
+    say_heading "Running apt-get update with the upstream sources..."
+    if ! run_apt_get_update "$WORK_DIR/apt-get-update.log"; then
+      warn "apt-get update reported errors; the sources were restored anyway"
+    fi
+  fi
+  say_heading "Switched back from $STATE_MIRROR_URL:"
+  print_unset_plan completed
+  say_success "apt now uses the upstream repositories directly."
+}
+
+command_get() {
+  reject_extra_arguments get "$@"
+  if load_state; then
+    printf '%s\n' "$STATE_MIRROR_URL"
+  else
+    exit 1
+  fi
+}
+
+command_upstreams() {
+  reject_extra_arguments upstreams "$@"
+  load_upstream_map
+  local prefix
+  for prefix in "${UPSTREAM_PREFIXES[@]}"; do
+    printf '%-40s %s\n' "$prefix" "${MIRROR_PATH_BY_PREFIX[$prefix]}"
+  done
+}
+
+command_version() {
+  reject_extra_arguments version "$@"
+  printf 'apt-registry %s\n' "$APT_REGISTRY_VERSION"
+}
+
+command_help() {
+  print_help
+}
+
+list_uris_from_source_files() {
+  local index
+  COLLECTED_URIS=()
+  collect_source_files
+  for index in "${!SOURCE_PATHS[@]}"; do
+    transform_source_file "${SOURCE_FORMATS[index]}" "${SOURCE_PATHS[index]}" /dev/null collect_uri
+  done
+  if ((${#COLLECTED_URIS[@]} > 0)); then
+    printf '%s\n' "${COLLECTED_URIS[@]}"
+  fi
+}
+
+list_apt_source_uris() {
+  local index_targets=""
+  index_targets=$(apt-get indextargets --no-release-info --format "\$(REPO_URI)" 2>/dev/null || true)
+  if [[ -z $index_targets ]]; then
+    index_targets=$(list_uris_from_source_files)
+  fi
+  if [[ -n $index_targets ]]; then
+    printf '%s\n' "$index_targets" | sed -E 's:([^/])/+$:\1:' | awk 'NF && !seen[$0]++'
+  fi
+}
+
+configured_url_from_environment() {
+  if [[ -n ${APT_REGISTRY_URL:-} ]] && try_normalize_mirror_url "$APT_REGISTRY_URL"; then
+    printf '%s' "$NORMALIZED_URL"
+  fi
+}
+
+print_reachability() {
+  local probe_url=$1 origin_note=$2
+  if mirror_is_reachable "$probe_url"; then
+    printf 'reachable:  yes%s\n' "$origin_note"
+  else
+    printf 'reachable:  no, %s%s\n' "$PING_FAILURE" "$origin_note"
+  fi
+}
+
+proxy_lines_affecting_mirror() {
+  local mirror_host=$1
+  local line key value key_host
+  while IFS= read -r line; do
+    read -r key value <<<"$line"
+    value=${value%;}
+    value=${value//\"/}
+    if [[ -z $value || ${value,,} == direct ]]; then
+      continue
+    fi
+    key_host=$(printf '%s' "$key" | sed -nE 's/^Acquire::[A-Za-z]+::Proxy::(.+)$/\1/Ip')
+    if [[ -n $key_host && ${key_host,,} != "${mirror_host,,}" ]]; then
+      continue
+    fi
+    printf '%s\n' "$line"
+  done < <(apt-config dump 2>/dev/null | grep -i 'Acquire::.*::Proxy' || true)
+}
+
+mirror_host_bypasses_proxy() {
+  local mirror_host=$1
+  local dump
+  dump=$(apt-config dump 2>/dev/null || true)
+  grep -qiE "^Acquire::[a-z]+::Proxy::${mirror_host//./\\.} \"DIRECT\";" <<<"$dump"
+}
+
+warn_about_apt_proxy() {
+  local mirror_url=$1
+  local mirror_host=""
+  if [[ -n $mirror_url ]]; then
+    mirror_host=$(host_of_url "$mirror_url")
+    if mirror_host_bypasses_proxy "$mirror_host"; then
+      return 0
+    fi
+  fi
+  local proxy_lines
+  proxy_lines=$(proxy_lines_affecting_mirror "$mirror_host")
+  if [[ -n $proxy_lines ]]; then
+    warn "apt is configured to use a proxy, so traffic to the mirror goes through it:"
+    printf '%s\n' "$proxy_lines" | sed 's/^/  /' >&2
+    say "  To bypass it for the mirror: echo 'Acquire::http::Proxy::${mirror_host:-<mirror-host>} \"DIRECT\";' | sudo tee /etc/apt/apt.conf.d/99apt-registry-no-proxy"
+  fi
+}
+
+print_status_sources() {
+  local active_url=$1 hand_set_url=$2
+  local -a uris=()
+  mapfile -t uris < <(list_apt_source_uris)
+  STATUS_MIRROR_ENTRIES=0
+  STATUS_HAND_SET_ENTRIES=0
+  printf '\nsources apt uses:\n'
+  if ((${#uris[@]} == 0)); then
+    printf '  (none found)\n'
+    return 0
+  fi
+  local uri
+  for uri in "${uris[@]}"; do
+    if uri_is_under_url "$uri" "$active_url"; then
+      STATUS_MIRROR_ENTRIES=$((STATUS_MIRROR_ENTRIES + 1))
+      printf '  %-7s %s\n' mirror "$uri"
+    elif uri_is_under_url "$uri" "$hand_set_url"; then
+      STATUS_HAND_SET_ENTRIES=$((STATUS_HAND_SET_ENTRIES + 1))
+      printf '  %-7s %s\n' mirror "$uri"
+    else
+      printf '  %-7s %s\n' direct "$uri"
+    fi
+  done
+}
+
+command_status() {
+  reject_extra_arguments status "$@"
+  local active_url="" environment_url
+  environment_url=$(configured_url_from_environment)
+  if load_state; then
+    active_url=$STATE_MIRROR_URL
+    printf 'mirror:     %s\n' "$active_url"
+    printf 'set at:     %s (apt-registry %s)\n' "${STATE_SET_AT:-unknown}" "${STATE_VERSION:-unknown}"
+    print_reachability "$active_url" ""
+  else
+    printf 'mirror:     direct\n'
+    if [[ -n $environment_url ]]; then
+      print_reachability "$environment_url" " ($environment_url from APT_REGISTRY_URL)"
+    fi
+  fi
+  local hand_set_url=""
+  if [[ -z $active_url ]]; then
+    hand_set_url=$environment_url
+  fi
+  print_status_sources "$active_url" "$hand_set_url"
+  warn_about_apt_proxy "${active_url:-$environment_url}"
+  if [[ -n $active_url ]] && ((STATUS_MIRROR_ENTRIES == 0)); then
+    warn "state says $active_url is active, but no source points to it anymore (drift); run 'apt-registry unset' to restore the originals, or 'apt-registry set' again"
+  fi
+  if ((STATUS_HAND_SET_ENTRIES > 0)); then
+    warn "sources point to $hand_set_url but apt-registry has no state for it (set by hand?); 'apt-registry unset' cannot restore them"
+  fi
+}
+
+main() {
+  umask 022
+  enable_colors_for_terminal
+  trap cleanup_on_exit EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  if (($# == 0)); then
+    print_help >&2
+    exit "$EXIT_USAGE"
+  fi
+  local command_name=$1
+  shift
+  case $command_name in
+    set) command_set "$@" ;;
+    unset) command_unset "$@" ;;
+    get) command_get "$@" ;;
+    status) command_status "$@" ;;
+    upstreams) command_upstreams "$@" ;;
+    version | --version | -V) command_version "$@" ;;
+    help | --help | -h) command_help ;;
+    *) usage_error "unknown command: $command_name" ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+STATE_DIR=/var/lib/apt-registry
+
+if [ "$1" = purge ]; then
+  if [ -f "$STATE_DIR/state" ]; then
+    echo "apt-registry: keeping $STATE_DIR because a mirror is still active; it holds the original sources." >&2
+  else
+    rm -rf "$STATE_DIR"
+  fi
+fi
+
+exit 0

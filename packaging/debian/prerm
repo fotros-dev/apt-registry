@@ -1,0 +1,17 @@
+#!/bin/sh
+set -e
+
+STATE_FILE=/var/lib/apt-registry/state
+
+active_mirror_url() {
+  sed -n 's/^mirror_url=//p' "$STATE_FILE"
+}
+
+if [ "$1" = remove ] && [ -f "$STATE_FILE" ]; then
+  mirror_url=$(active_mirror_url)
+  echo "apt-registry: warning: the mirror ${mirror_url} is still active." >&2
+  echo "apt-registry: your apt sources still point at the mirror; they are left unchanged." >&2
+  echo "apt-registry: run 'apt-registry unset' first, or reinstall apt-registry and run it later." >&2
+fi
+
+exit 0

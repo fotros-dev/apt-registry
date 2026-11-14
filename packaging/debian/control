@@ -1,0 +1,14 @@
+Package: apt-registry
+Version: @VERSION@
+Architecture: all
+Maintainer: fotros-dev <fotros-dev@users.noreply.github.com>
+Installed-Size: @INSTALLED_SIZE@
+Depends: apt, bash
+Section: admin
+Priority: optional
+Homepage: https://github.com/fotros-dev/apt-registry
+Description: switch apt sources between upstream repositories and a mirror
+ apt-registry rewrites the URIs of known upstream repositories in
+ /etc/apt/sources.list and /etc/apt/sources.list.d/ so that apt fetches
+ through an apt mirror, and restores the original files on request.
+ It is the apt equivalent of "npm config set registry".
